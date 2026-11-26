@@ -22,7 +22,7 @@ permissions:
 jobs:
   rescale:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -91,13 +91,20 @@ jobs:
             exit 0
           fi
 
-          AVAIL=$(api_get "/server_types?name=${TO_TYPE}" | jq -r --arg l "${LOCATION}" \
-            '[.server_types[]? | select(.name=="'"${TO_TYPE}"'") | .locations[]? | select(.name==$l) | .available] | first // "unknown"')
-          echo "Dostepnosc ${TO_TYPE} w ${LOCATION}: ${AVAIL}"
-          if [ "$AVAIL" != "true" ]; then
-            [ "$AVAIL" = "unknown" ] && echo "::warning::Brak pola available w odpowiedzi API - nie wykonuje akcji."
-            exit 0
-          fi
+          # Petla wewnatrz jednego uruchomienia: sprawdzanie co 15 s przez ~4,5 minuty
+          # (cron GitHuba nie schodzi ponizej 5 min, wiec petla zamyka luke miedzy uruchomieniami).
+          DEADLINE=$((SECONDS+270))
+          AVAIL="unknown"
+          while :; do
+            AVAIL=$(api_get "/server_types?name=${TO_TYPE}" | jq -r --arg l "${LOCATION}" \
+              '[.server_types[]? | select(.name=="'"${TO_TYPE}"'") | .locations[]? | select(.name==$l) | .available] | first // "unknown"')
+            echo "$(date -u +%H:%M:%S) dostepnosc ${TO_TYPE} w ${LOCATION}: ${AVAIL}"
+            [ "$AVAIL" = "true" ] && break
+            [ "$AVAIL" = "unknown" ] && echo "::warning::Brak pola available w odpowiedzi API (lub blad API) - nie wykonuje akcji."
+            [ "$SECONDS" -ge "$DEADLINE" ] && break
+            sleep 15
+          done
+          if [ "$AVAIL" != "true" ]; then exit 0; fi
 
           notify "Hetzner rescale START" "${TO_TYPE} dostepny w ${LOCATION}. Wylaczam serwer ${SERVER_ID} i zmieniam typ. Uslugi beda niedostepne kilka minut." high
           STARTED_ACTION=1
