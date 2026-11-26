@@ -1,0 +1,129 @@
+name: Hetzner rescale CX23 -> CX33
+
+# Umiesc ten plik w PRYWATNYM repozytorium jako:
+#   .github/workflows/rescale-cx33.yml
+# (na domyslnej galezi, inaczej harmonogram nie ruszy).
+# Wymagany secret: HCLOUD_TOKEN  (token Hetznera z zapisem, projekt 14327462)
+# Opcjonalny secret: NTFY_TOPIC  (domyslnie hetzner-cx33-wdkw-k7q2x9m4)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: hetzner-rescale
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # pozwala workflow wylaczyc sam siebie po sukcesie / bledzie
+  contents: read
+
+jobs:
+  rescale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      GH_TOKEN: ${{ github.token }}
+      SERVER_ID: '127885180'
+      LOCATION: nbg1
+      FROM_TYPE: cx23
+      TO_TYPE: cx33
+      UPGRADE_DISK: 'false'   # false = dysk zostaje 40 GB, mozna wrocic do CX23
+    steps:
+      - name: Sprawdz dostepnosc i wykonaj rescale
+        shell: bash
+        run: |
+          set -uo pipefail
+          API="https://api.hetzner.cloud/v1"
+          TOPIC="${NTFY_TOPIC:-hetzner-cx33-wdkw-k7q2x9m4}"
+          H=(-H "Authorization: Bearer ${HCLOUD_TOKEN}" -H "Content-Type: application/json")
+          STARTED_ACTION=0
+
+          notify() { # tytul, tresc, priorytet
+            curl -s -m 15 -H "Title: $1" -H "Priority: ${3:-urgent}" -H "Tags: server" \
+              -d "$2" "https://ntfy.sh/${TOPIC}" >/dev/null || true
+          }
+          disable_self() { gh workflow disable "${GITHUB_WORKFLOW}" --repo "${GITHUB_REPOSITORY}" || true; }
+          api_get()  { curl -sS -m 30 "${H[@]}" "${API}$1"; }
+          api_post() { curl -sS -m 30 "${H[@]}" -X POST -d "${2:-{\}}" "${API}$1"; }
+          status()   { api_get "/servers/${SERVER_ID}" | jq -r '.server.status // "unknown"'; }
+          stype()    { api_get "/servers/${SERVER_ID}" | jq -r '.server.server_type.name // "unknown"'; }
+          wait_status() { # oczekiwany status, timeout w sekundach
+            local t=0
+            while [ "$t" -lt "$2" ]; do
+              [ "$(status)" = "$1" ] && return 0
+              sleep 5; t=$((t+5))
+            done
+            return 1
+          }
+          wait_action() { # id akcji, timeout
+            local t=0 s
+            while [ "$t" -lt "$2" ]; do
+              s=$(api_get "/actions/$1" | jq -r '.action.status // "unknown"')
+              [ "$s" = "success" ] && return 0
+              [ "$s" = "error" ] && return 1
+              sleep 5; t=$((t+5))
+            done
+            return 1
+          }
+          ensure_running() {
+            if [ "$(status)" = "off" ]; then
+              api_post "/servers/${SERVER_ID}/actions/poweron" >/dev/null
+              wait_status running 180 || true
+            fi
+          }
+          on_exit() {
+            # zabezpieczenie: jesli po drodze cos poszlo nie tak, serwer ma wrocic do dzialania
+            if [ "$STARTED_ACTION" = "1" ]; then ensure_running; fi
+          }
+          trap on_exit EXIT
+
+          CUR=$(stype)
+          if [ "$CUR" = "${TO_TYPE}" ]; then
+            notify "Hetzner rescale" "Serwer jest juz ${TO_TYPE}. Wylaczam workflow." default
+            disable_self; exit 0
+          fi
+          if [ "$CUR" != "${FROM_TYPE}" ]; then
+            echo "::warning::Nieoczekiwany typ serwera: ${CUR} (oczekiwano ${FROM_TYPE}). Przerywam."
+            exit 0
+          fi
+
+          AVAIL=$(api_get "/server_types?name=${TO_TYPE}" | jq -r --arg l "${LOCATION}" \
+            '[.server_types[]? | select(.name=="'"${TO_TYPE}"'") | .locations[]? | select(.name==$l) | .available] | first // "unknown"')
+          echo "Dostepnosc ${TO_TYPE} w ${LOCATION}: ${AVAIL}"
+          if [ "$AVAIL" != "true" ]; then
+            [ "$AVAIL" = "unknown" ] && echo "::warning::Brak pola available w odpowiedzi API - nie wykonuje akcji."
+            exit 0
+          fi
+
+          notify "Hetzner rescale START" "${TO_TYPE} dostepny w ${LOCATION}. Wylaczam serwer ${SERVER_ID} i zmieniam typ. Uslugi beda niedostepne kilka minut." high
+          STARTED_ACTION=1
+
+          # 1) lagodne wylaczenie, w razie braku reakcji twarde
+          api_post "/servers/${SERVER_ID}/actions/shutdown" >/dev/null
+          if ! wait_status off 120; then
+            api_post "/servers/${SERVER_ID}/actions/poweroff" >/dev/null
+            wait_status off 60 || { notify "Hetzner rescale BLAD" "Nie udalo sie wylaczyc serwera. Workflow wylaczony." urgent; disable_self; exit 1; }
+          fi
+
+          # 2) zmiana typu
+          RESP=$(api_post "/servers/${SERVER_ID}/actions/change_type" \
+            "{\"server_type\":\"${TO_TYPE}\",\"upgrade_disk\":${UPGRADE_DISK}}")
+          AID=$(echo "$RESP" | jq -r '.action.id // empty')
+          if [ -z "$AID" ] || ! wait_action "$AID" 300; then
+            echo "$RESP"
+            ensure_running
+            notify "Hetzner rescale BLAD" "change_type nie powiodl sie, serwer wlaczony ponownie. Workflow wylaczony (zadnych kolejnych prob). Blad: $(echo "$RESP" | jq -r '.error.message // "brak"')" urgent
+            disable_self; exit 1
+          fi
+
+          # 3) wlaczenie i weryfikacja
+          api_post "/servers/${SERVER_ID}/actions/poweron" >/dev/null
+          wait_status running 180 || true
+          FINAL_T=$(stype); FINAL_S=$(status)
+          notify "Hetzner rescale GOTOWE" "Serwer: ${FINAL_T}, status: ${FINAL_S}. Workflow wylaczony." urgent
+          STARTED_ACTION=0
+          disable_self
