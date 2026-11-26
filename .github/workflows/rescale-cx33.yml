@@ -97,7 +97,7 @@ jobs:
           AVAIL="unknown"
           while :; do
             AVAIL=$(api_get "/server_types?name=${TO_TYPE}" | jq -r --arg l "${LOCATION}" \
-              '[.server_types[]? | select(.name=="'"${TO_TYPE}"'") | .locations[]? | select(.name==$l) | .available] | first // "unknown"')
+              '[.server_types[]? | select(.name=="'"${TO_TYPE}"'") | .locations[]? | select(.name==$l) | .available] | first | if . == null then "unknown" else tostring end')
             echo "$(date -u +%H:%M:%S) dostepnosc ${TO_TYPE} w ${LOCATION}: ${AVAIL}"
             [ "$AVAIL" = "true" ] && break
             [ "$AVAIL" = "unknown" ] && echo "::warning::Brak pola available w odpowiedzi API (lub blad API) - nie wykonuje akcji."
