@@ -33,6 +33,9 @@ jobs:
       TO_TYPE: cx33
       UPGRADE_DISK: 'false'   # false = dysk zostaje 40 GB, mozna wrocic do CX23
     steps:
+      - name: Znacznik startu
+        run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Sprawdz dostepnosc i wykonaj rescale
         shell: bash
         run: |
@@ -134,3 +137,22 @@ jobs:
           notify "Hetzner rescale GOTOWE" "Serwer: ${FINAL_T}, status: ${FINAL_S}. Workflow wylaczony." urgent
           STARTED_ACTION=0
           disable_self
+
+      # Lancuch: po pelnym przebiegu (>= 240 s) od razu startuje kolejny, bez czekania na cron.
+      # Dzieki temu sprawdzanie jest ciagle 24/7, a cron co 5 min dziala tylko jako
+      # "pies strozujacy" na wypadek, gdyby lancuch sie przerwal.
+      # Gdy workflow zostal wylaczony (sukces/blad), dispatch sie nie powiedzie i lancuch konczy sie.
+      - name: Uruchom kolejny przebieg
+        if: always()
+        shell: bash
+        run: |
+          ELAPSED=$(( $(date +%s) - ${T0:-0} ))
+          echo "Czas przebiegu: ${ELAPSED}s"
+          if [ "$ELAPSED" -ge 240 ]; then
+            gh workflow run "${GITHUB_WORKFLOW}" --repo "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF_NAME}" \
+              || echo "Dispatch niemozliwy (workflow wylaczony?) - koniec lancucha."
+          else
+            echo "Krotki przebieg - nie lancuchuje (zapobiega petli)."
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
