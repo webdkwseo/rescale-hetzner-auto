@@ -84,7 +84,23 @@ jobs:
           }
           trap on_exit EXIT
 
-          CUR=$(stype)
+          # Odczyt aktualnego typu serwera z ponawianiem (chwilowe bledy API nie moga konczyc lancucha)
+          CUR="unknown"
+          for i in 1 2 3 4 5 6; do
+            RAW=$(curl -sS -m 30 -w '\n%{http_code}' "${H[@]}" "${API}/servers/${SERVER_ID}" 2>&1) || true
+            CODE=$(printf '%s' "$RAW" | tail -n1)
+            BODY=$(printf '%s' "$RAW" | sed '$d')
+            CUR=$(printf '%s' "$BODY" | jq -r '.server.server_type.name // "unknown"' 2>/dev/null || echo unknown)
+            CUR="${CUR:-unknown}"   # pusta odpowiedz (np. blad sieci) = unknown
+            [ "$CUR" != "unknown" ] && break
+            echo "Proba ${i}/6: nie udalo sie odczytac typu serwera. HTTP ${CODE}: $(printf '%s' "$BODY" | head -c 300)"
+            sleep 10
+          done
+          if [ "$CUR" = "unknown" ]; then
+            echo "::warning::API Hetznera nie zwrocilo typu serwera po 6 probach. Czekam i probuje w kolejnym przebiegu."
+            REST=$((270 - SECONDS)); [ "$REST" -gt 0 ] && sleep "$REST"
+            exit 0   # przebieg trwa >= 240 s, wiec lancuch nadal sie kontynuuje
+          fi
           if [ "$CUR" = "${TO_TYPE}" ]; then
             notify "Hetzner rescale" "Serwer jest juz ${TO_TYPE}. Wylaczam workflow." default
             disable_self; exit 0
